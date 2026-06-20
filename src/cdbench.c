@@ -31,6 +31,7 @@
 #define DISC_SECTOR_SIZE 2048UL
 #define EXALL_BUFSIZE 32768UL
 #define MAX_CACHE_PROBE (4UL * 1024UL * 1024UL)
+#define CACHE_HOT_SET (32UL * 1024UL)
 
 struct Device *TimerBase;
 
@@ -191,6 +192,9 @@ typedef struct Summary {
     uint64_t cache_seq_warm_cold_milli;
     uint64_t cache_sector_warm_cold_milli;
     uint64_t cache_partial_warm_cold_milli;
+    uint64_t cache_shuffle_warm_cold_milli;
+    uint64_t cache_eviction_warm_cold_milli;
+    uint64_t cache_metadata_warm_cold_milli;
 
     char raw_status[16];
     char raw_error[64];
@@ -990,6 +994,12 @@ static void summary_record(RunContext *ctx, const Result *r)
             s->cache_sector_warm_cold_milli = r->warm_cold_milli;
         else if (strcmp(r->test, "cache_partial") == 0)
             s->cache_partial_warm_cold_milli = r->warm_cold_milli;
+        else if (strcmp(r->test, "cache_shuffle") == 0)
+            s->cache_shuffle_warm_cold_milli = r->warm_cold_milli;
+        else if (strcmp(r->test, "cache_eviction") == 0)
+            s->cache_eviction_warm_cold_milli = r->warm_cold_milli;
+        else if (strcmp(r->test, "cache_metadata") == 0)
+            s->cache_metadata_warm_cold_milli = r->warm_cold_milli;
     } else if (strcmp(r->test, "raw_seq_data") == 0) {
         copy_text(s->raw_status, sizeof(s->raw_status), r->status);
         copy_text(s->raw_error, sizeof(s->raw_error), r->error);
@@ -1203,6 +1213,18 @@ static void emit_summary(const RunContext *ctx)
         if (s->cache_partial_warm_cold_milli) {
             printf(", partial ");
             print_milli(s->cache_partial_warm_cold_milli);
+        }
+        if (s->cache_shuffle_warm_cold_milli) {
+            printf(", shuffle ");
+            print_milli(s->cache_shuffle_warm_cold_milli);
+        }
+        if (s->cache_eviction_warm_cold_milli) {
+            printf(", eviction ");
+            print_milli(s->cache_eviction_warm_cold_milli);
+        }
+        if (s->cache_metadata_warm_cold_milli) {
+            printf(", metadata ");
+            print_milli(s->cache_metadata_warm_cold_milli);
         }
         printf("\n");
     }
@@ -2159,12 +2181,13 @@ static void run_mixed_switch(RunContext *ctx)
     Close(afh);
 }
 
-static TimedRead read_range_once(const RunContext *ctx, const char *path,
-                                 uint64_t bytes, uint32_t chunk,
-                                 const char *shape)
+static TimedRead read_range_at_once(const RunContext *ctx, const char *path,
+                                    uint64_t base, uint64_t bytes,
+                                    uint32_t chunk, const char *shape)
 {
     BPTR fh;
     void *buf;
+    uint32_t *order = NULL;
     uint64_t start;
     uint64_t done = 0;
     TimedRead tr;
@@ -2179,6 +2202,52 @@ static TimedRead read_range_once(const RunContext *ctx, const char *path,
         Close(fh);
         return tr;
     }
+    if (shape && strcmp(shape, "shuffle") == 0) {
+        uint64_t blocks64 = bytes / chunk;
+        uint32_t blocks;
+        uint32_t i;
+        uint32_t seed = ctx->cfg.seed ? ctx->cfg.seed : 1;
+
+        if (blocks64 == 0)
+            blocks64 = 1;
+        if (blocks64 > 65535ULL)
+            blocks64 = 65535ULL;
+        blocks = (uint32_t)blocks64;
+        order = (uint32_t *)malloc((size_t)blocks * sizeof(order[0]));
+        if (!order) {
+            free(buf);
+            Close(fh);
+            return tr;
+        }
+        for (i = 0; i < blocks; i++)
+            order[i] = i;
+        for (i = blocks - 1; i > 0; i--) {
+            uint32_t j = lcg_next(&seed) % (i + 1);
+            uint32_t tmp = order[i];
+
+            order[i] = order[j];
+            order[j] = tmp;
+        }
+        start = timer_now(&ctx->timer);
+        for (i = 0; i < blocks; i++) {
+            uint64_t off = base + (uint64_t)order[i] * chunk;
+            LONG got;
+
+            Seek(fh, (LONG)off, OFFSET_BEGINNING);
+            got = Read(fh, buf, chunk);
+            if (got <= 0)
+                break;
+            tr.bytes_read += (uint32_t)got;
+        }
+        free(order);
+        free(buf);
+        Close(fh);
+        tr.elapsed_us = ticks_to_us(&ctx->timer,
+                                    timer_now(&ctx->timer) - start);
+        return tr;
+    }
+    if (base)
+        Seek(fh, (LONG)base, OFFSET_BEGINNING);
     start = timer_now(&ctx->timer);
     while (done < bytes) {
         uint32_t want = chunk;
@@ -2187,11 +2256,11 @@ static TimedRead read_range_once(const RunContext *ctx, const char *path,
         if (done + want > bytes)
             want = (uint32_t)(bytes - done);
         if (shape && strcmp(shape, "partial") == 0) {
-            Seek(fh, (LONG)done, OFFSET_BEGINNING);
+            Seek(fh, (LONG)(base + done), OFFSET_BEGINNING);
             want = want > 512 ? 512 : want;
             done += DISC_SECTOR_SIZE;
         } else if (shape && strcmp(shape, "sector") == 0) {
-            Seek(fh, (LONG)done, OFFSET_BEGINNING);
+            Seek(fh, (LONG)(base + done), OFFSET_BEGINNING);
             want = DISC_SECTOR_SIZE;
             done += DISC_SECTOR_SIZE;
         } else {
@@ -2208,6 +2277,13 @@ static TimedRead read_range_once(const RunContext *ctx, const char *path,
     return tr;
 }
 
+static TimedRead read_range_once(const RunContext *ctx, const char *path,
+                                 uint64_t bytes, uint32_t chunk,
+                                 const char *shape)
+{
+    return read_range_at_once(ctx, path, 0, bytes, chunk, shape);
+}
+
 static void emit_cache_pair(RunContext *ctx, const CatalogEntry *entry,
                             uint64_t working_set, const char *shape,
                             const char *test)
@@ -2218,6 +2294,8 @@ static void emit_cache_pair(RunContext *ctx, const CatalogEntry *entry,
     uint32_t chunk = ctx->cfg.bufsize;
 
     if (strcmp(shape, "sector") == 0 || strcmp(shape, "partial") == 0)
+        chunk = DISC_SECTOR_SIZE;
+    else if (strcmp(shape, "shuffle") == 0)
         chunk = DISC_SECTOR_SIZE;
     cold = read_range_once(ctx, entry->path, working_set, chunk, shape);
     warm = read_range_once(ctx, entry->path, working_set, chunk, shape);
@@ -2236,10 +2314,96 @@ static void emit_cache_pair(RunContext *ctx, const CatalogEntry *entry,
     emit_result(ctx, &r);
 }
 
+static void emit_cache_eviction(RunContext *ctx, const CatalogEntry *entry,
+                                uint64_t eviction_bytes)
+{
+    TimedRead cold;
+    TimedRead warm;
+    TimedRead reread;
+    Result r;
+
+    if (entry->size < CACHE_HOT_SET + eviction_bytes)
+        return;
+    cold = read_range_at_once(ctx, entry->path, 0, CACHE_HOT_SET,
+                              DISC_SECTOR_SIZE, "sector");
+    warm = read_range_at_once(ctx, entry->path, 0, CACHE_HOT_SET,
+                              DISC_SECTOR_SIZE, "sector");
+    (void)cold;
+    read_range_at_once(ctx, entry->path, CACHE_HOT_SET, eviction_bytes,
+                       ctx->cfg.bufsize, "stream");
+    reread = read_range_at_once(ctx, entry->path, 0, CACHE_HOT_SET,
+                                DISC_SECTOR_SIZE, "sector");
+    memset(&r, 0, sizeof(r));
+    r.test = "cache_eviction";
+    r.status = "ok";
+    r.path = entry->path;
+    r.access_shape = "eviction";
+    r.file_size = entry->size;
+    r.hot_set_bytes = CACHE_HOT_SET;
+    r.eviction_bytes = eviction_bytes;
+    r.bytes = reread.bytes_read;
+    r.elapsed_us = reread.elapsed_us;
+    r.rate_kib_s = rate_kib_s(reread.bytes_read, reread.elapsed_us);
+    if (warm.elapsed_us)
+        r.warm_cold_milli = (reread.elapsed_us * 1000ULL) /
+            warm.elapsed_us;
+    emit_result(ctx, &r);
+}
+
+static TimedRead metadata_lock_once(const RunContext *ctx, uint32_t count)
+{
+    uint32_t done = 0;
+    size_t i;
+    uint64_t start;
+    TimedRead tr;
+
+    memset(&tr, 0, sizeof(tr));
+    start = timer_now(&ctx->timer);
+    for (i = 0; i < ctx->catalog.count && done < count; i++) {
+        const CatalogEntry *e = &ctx->catalog.items[i];
+        BPTR lock;
+
+        if (e->kind != ENTRY_DATA && e->kind != ENTRY_DIR)
+            continue;
+        lock = Lock((CONST_STRPTR)e->path, SHARED_LOCK);
+        if (lock)
+            UnLock(lock);
+        done++;
+    }
+    tr.elapsed_us = ticks_to_us(&ctx->timer, timer_now(&ctx->timer) - start);
+    tr.bytes_read = done;
+    return tr;
+}
+
+static void emit_cache_metadata(RunContext *ctx, uint32_t count)
+{
+    TimedRead cold;
+    TimedRead warm;
+    Result r;
+
+    cold = metadata_lock_once(ctx, count);
+    warm = metadata_lock_once(ctx, count);
+    memset(&r, 0, sizeof(r));
+    r.test = "cache_metadata";
+    r.status = warm.bytes_read ? "ok" : "skipped";
+    r.error = warm.bytes_read ? "" : "no metadata paths";
+    r.path = ctx->cfg.device;
+    r.selector = "pathset";
+    r.access_shape = "metadata";
+    r.ops = warm.bytes_read;
+    r.elapsed_us = warm.elapsed_us;
+    if (warm.elapsed_us)
+        r.ops_s = (warm.bytes_read * 1000000ULL) / warm.elapsed_us;
+    if (cold.elapsed_us)
+        r.warm_cold_milli = (warm.elapsed_us * 1000ULL) / cold.elapsed_us;
+    emit_result(ctx, &r);
+}
+
 static void run_cache_probe(RunContext *ctx)
 {
-    const CatalogEntry *entry = find_largest(&ctx->catalog, ENTRY_DATA);
+    const CatalogEntry *entry = select_seq_data_entry(&ctx->catalog, NULL);
     uint64_t ws;
+    uint32_t path_count;
 
     if (!ctx->cfg.cache)
         return;
@@ -2257,7 +2421,15 @@ static void run_cache_probe(RunContext *ctx)
         emit_cache_pair(ctx, entry, ws, "stream", "cache_seq");
         emit_cache_pair(ctx, entry, ws, "sector", "cache_sector");
         emit_cache_pair(ctx, entry, ws, "partial", "cache_partial");
+        emit_cache_pair(ctx, entry, ws, "shuffle", "cache_shuffle");
+        emit_cache_eviction(ctx, entry, ws);
         if (ws > (1ULL << 30))
+            break;
+    }
+    for (path_count = 8; path_count <= ctx->catalog.count;
+         path_count <<= 1) {
+        emit_cache_metadata(ctx, path_count);
+        if (path_count > (1UL << 20))
             break;
     }
 }
