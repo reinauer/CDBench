@@ -25,8 +25,11 @@ The default human-readable output prints a compact summary. `VERBOSE` prints
 all per-test rows with the full selected paths. `CSV` always emits the full
 machine-readable result set.
 
-The raw SCSI baseline is opt-in. In this initial implementation it reports a
-clear skipped row until safe data-track LBA equivalence is implemented.
+The raw SCSI baseline is opt-in. It opens the backing Exec device identified
+from the mount, issues SCSI READ CAPACITY and READ(10) through `HD_SCSICMD`
+or `NSCMD_TD_SCSI`, and only reads 2048-byte sectors. The raw row is a device
+baseline from LBA 0; `seq_data_efficiency` remains skipped until the tool can
+prove that the raw range matches the filesystem file being read.
 
 `make fixture-iso` creates `build/fixtures/cdbench-plain.iso` with volume
 label `CDBENCH_FIXTURE`, a 32 MiB sequential target, an 8 MiB random target,

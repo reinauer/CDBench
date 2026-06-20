@@ -6,12 +6,16 @@
 
 #include <exec/types.h>
 #include <exec/memory.h>
+#include <exec/io.h>
+#include <exec/errors.h>
 #include <dos/dos.h>
 #include <dos/dosasl.h>
 #include <dos/dosextens.h>
 #include <dos/exall.h>
 #include <dos/filehandler.h>
 #include <devices/timer.h>
+#include <devices/scsidisk.h>
+#include <devices/newstyle.h>
 
 #include <proto/dos.h>
 #include <proto/exec.h>
@@ -23,6 +27,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef NSCMD_TD_SCSI
+#define NSCMD_TD_SCSI 0xC004
+#endif
 
 #define DEFAULT_BUFSIZE 32768UL
 #define DEFAULT_READSIZE 2048UL
@@ -2434,22 +2442,323 @@ static void run_cache_probe(RunContext *ctx)
     }
 }
 
-static void run_raw_stub(RunContext *ctx)
+typedef struct RawSCSIDevice {
+    struct MsgPort *port;
+    struct IOStdReq *io;
+    UWORD io_command;
+    const char *method;
+} RawSCSIDevice;
+
+static uint32_t be32(const UBYTE *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static void put_be16(UBYTE *p, uint32_t v)
+{
+    p[0] = (UBYTE)((v >> 8) & 0xff);
+    p[1] = (UBYTE)(v & 0xff);
+}
+
+static void put_be32(UBYTE *p, uint32_t v)
+{
+    p[0] = (UBYTE)((v >> 24) & 0xff);
+    p[1] = (UBYTE)((v >> 16) & 0xff);
+    p[2] = (UBYTE)((v >> 8) & 0xff);
+    p[3] = (UBYTE)(v & 0xff);
+}
+
+static void raw_close(RawSCSIDevice *raw)
+{
+    if (raw->io) {
+        if (raw->io->io_Device)
+            CloseDevice((struct IORequest *)raw->io);
+        DeleteIORequest((struct IORequest *)raw->io);
+    }
+    if (raw->port)
+        DeleteMsgPort(raw->port);
+    memset(raw, 0, sizeof(*raw));
+}
+
+static int raw_open(RunContext *ctx, RawSCSIDevice *raw)
+{
+    BYTE err;
+
+    memset(raw, 0, sizeof(*raw));
+    if (!ctx->ident.have_exec)
+        return -1;
+    raw->port = CreateMsgPort();
+    if (!raw->port)
+        return -1;
+    raw->io = (struct IOStdReq *)CreateIORequest(raw->port,
+                                                 sizeof(struct IOStdReq));
+    if (!raw->io) {
+        raw_close(raw);
+        return -1;
+    }
+    err = OpenDevice((CONST_STRPTR)ctx->ident.exec_device,
+                     ctx->ident.exec_unit, (struct IORequest *)raw->io,
+                     ctx->ident.open_flags);
+    if (err != 0) {
+        raw_close(raw);
+        return (int)err;
+    }
+    return 0;
+}
+
+static int raw_scsi_try(RawSCSIDevice *raw, UWORD io_command,
+                        UBYTE *cmd, UWORD cmd_len, void *data,
+                        ULONG data_len, UBYTE flags, ULONG *actual)
+{
+    struct SCSICmd scsi_cmd;
+    UBYTE sense_data[32];
+    int err;
+
+    memset(&scsi_cmd, 0, sizeof(scsi_cmd));
+    memset(sense_data, 0, sizeof(sense_data));
+    scsi_cmd.scsi_Data = (UWORD *)data;
+    scsi_cmd.scsi_Length = data_len;
+    scsi_cmd.scsi_Command = cmd;
+    scsi_cmd.scsi_CmdLength = cmd_len;
+    scsi_cmd.scsi_Flags = flags | SCSIF_AUTOSENSE;
+    scsi_cmd.scsi_SenseData = sense_data;
+    scsi_cmd.scsi_SenseLength = sizeof(sense_data);
+
+    raw->io->io_Command = io_command;
+    raw->io->io_Data = &scsi_cmd;
+    raw->io->io_Length = sizeof(scsi_cmd);
+    err = DoIO((struct IORequest *)raw->io);
+    if (raw->io->io_Error)
+        err = raw->io->io_Error;
+    if (actual)
+        *actual = scsi_cmd.scsi_Actual;
+    if (err)
+        return err;
+    if (scsi_cmd.scsi_Status)
+        return HFERR_BadStatus;
+    return 0;
+}
+
+static int raw_scsi_transfer(RawSCSIDevice *raw, UBYTE *cmd,
+                             UWORD cmd_len, void *data, ULONG data_len,
+                             UBYTE flags, ULONG *actual)
+{
+    int err;
+
+    if (raw->io_command)
+        return raw_scsi_try(raw, raw->io_command, cmd, cmd_len, data,
+                            data_len, flags, actual);
+    err = raw_scsi_try(raw, HD_SCSICMD, cmd, cmd_len, data, data_len,
+                       flags, actual);
+    if (err == IOERR_NOCMD) {
+        err = raw_scsi_try(raw, NSCMD_TD_SCSI, cmd, cmd_len, data,
+                           data_len, flags, actual);
+        if (!err) {
+            raw->io_command = NSCMD_TD_SCSI;
+            raw->method = "NSCMD_TD_SCSI";
+        }
+    } else if (!err) {
+        raw->io_command = HD_SCSICMD;
+        raw->method = "HD_SCSICMD";
+    }
+    return err;
+}
+
+static int raw_read_capacity(RawSCSIDevice *raw, uint32_t *last_lba,
+                             uint32_t *block_size)
+{
+    UBYTE cmd[10];
+    UBYTE data[8];
+    ULONG actual = 0;
+    int err;
+
+    memset(cmd, 0, sizeof(cmd));
+    memset(data, 0, sizeof(data));
+    cmd[0] = 0x25;
+    err = raw_scsi_transfer(raw, cmd, sizeof(cmd), data, sizeof(data),
+                            SCSIF_READ, &actual);
+    if (err)
+        return err;
+    if (actual && actual < sizeof(data))
+        return HFERR_BadStatus;
+    *last_lba = be32(data);
+    *block_size = be32(data + 4);
+    return 0;
+}
+
+static int raw_read10(RawSCSIDevice *raw, uint32_t lba,
+                      uint32_t sectors, void *buf, ULONG bytes)
+{
+    UBYTE cmd[10];
+    ULONG actual = 0;
+
+    memset(cmd, 0, sizeof(cmd));
+    cmd[0] = 0x28;
+    put_be32(cmd + 2, lba);
+    put_be16(cmd + 7, sectors);
+    return raw_scsi_transfer(raw, cmd, sizeof(cmd), buf, bytes,
+                             SCSIF_READ, &actual);
+}
+
+static void emit_efficiency_skip(RunContext *ctx, uint64_t raw_rate,
+                                 const char *reason)
 {
     Result r;
+
+    memset(&r, 0, sizeof(r));
+    r.test = "seq_data_efficiency";
+    r.status = "skipped";
+    r.error = reason;
+    r.raw_rate_kib_s = raw_rate;
+    emit_result(ctx, &r);
+}
+
+static void run_raw_tests(RunContext *ctx)
+{
+    RawSCSIDevice raw;
+    const CatalogEntry *seq_entry;
+    uint32_t block_size = 0;
+    uint32_t last_lba = 0;
+    uint64_t capacity_bytes;
+    uint64_t target_bytes;
+    uint64_t done = 0;
+    uint64_t start;
+    uint64_t elapsed = 0;
+    uint32_t chunk;
+    int maxbytes_limited;
+    void *buf;
+    const char *stop_reason = "full";
+    const char *raw_method;
+    Result r;
+    int err;
 
     if (!ctx->cfg.raw)
         return;
     memset(&r, 0, sizeof(r));
     r.test = "raw_seq_data";
-    r.status = "skipped";
-    r.error = "raw SCSI baseline LBA equivalence not implemented in v1";
+    if (!ctx->ident.have_exec) {
+        r.status = "skipped";
+        r.error = "backing Exec device not identified";
+        emit_result(ctx, &r);
+        emit_efficiency_skip(ctx, 0, "raw denominator unavailable");
+        return;
+    }
+
+    chunk = ctx->cfg.bufsize - (ctx->cfg.bufsize % DISC_SECTOR_SIZE);
+    if (chunk == 0) {
+        r.status = "skipped";
+        r.error = "BUFSIZE below one 2048-byte sector";
+        emit_result(ctx, &r);
+        emit_efficiency_skip(ctx, 0, "raw denominator unavailable");
+        return;
+    }
+    if (chunk > 0xffffUL * DISC_SECTOR_SIZE)
+        chunk = 0xffffUL * DISC_SECTOR_SIZE;
+
+    seq_entry = select_seq_data_entry(&ctx->catalog, NULL);
+    target_bytes = ctx->cfg.maxbytes ? ctx->cfg.maxbytes :
+        (seq_entry ? seq_entry->size : 16ULL * 1024ULL * 1024ULL);
+    target_bytes -= target_bytes % DISC_SECTOR_SIZE;
+    maxbytes_limited = ctx->cfg.maxbytes != 0;
+    if (target_bytes == 0) {
+        r.status = "skipped";
+        r.error = "raw byte count below one 2048-byte sector";
+        emit_result(ctx, &r);
+        emit_efficiency_skip(ctx, 0, "raw denominator unavailable");
+        return;
+    }
+
+    err = raw_open(ctx, &raw);
+    if (err) {
+        r.status = "error";
+        r.error = "OpenDevice failed";
+        emit_result(ctx, &r);
+        emit_efficiency_skip(ctx, 0, "raw denominator unavailable");
+        return;
+    }
+    err = raw_read_capacity(&raw, &last_lba, &block_size);
+    if (err) {
+        raw_close(&raw);
+        r.status = "error";
+        r.error = "READ CAPACITY failed";
+        emit_result(ctx, &r);
+        emit_efficiency_skip(ctx, 0, "raw denominator unavailable");
+        return;
+    }
+    if (block_size != DISC_SECTOR_SIZE) {
+        raw_close(&raw);
+        r.status = "skipped";
+        r.error = "raw sector size is not 2048 bytes";
+        emit_result(ctx, &r);
+        emit_efficiency_skip(ctx, 0, "raw denominator unavailable");
+        return;
+    }
+    capacity_bytes = ((uint64_t)last_lba + 1ULL) * DISC_SECTOR_SIZE;
+    if (target_bytes > capacity_bytes) {
+        target_bytes = capacity_bytes;
+        maxbytes_limited = 0;
+    }
+    buf = AllocVec(chunk, MEMF_PUBLIC);
+    if (!buf) {
+        raw_close(&raw);
+        r.status = "error";
+        r.error = "out of memory";
+        emit_result(ctx, &r);
+        emit_efficiency_skip(ctx, 0, "raw denominator unavailable");
+        return;
+    }
+
+    start = timer_now(&ctx->timer);
+    while (done < target_bytes) {
+        uint32_t want = chunk;
+        uint32_t sectors;
+
+        if (target_bytes - done < want)
+            want = (uint32_t)(target_bytes - done);
+        want -= want % DISC_SECTOR_SIZE;
+        if (want == 0)
+            break;
+        sectors = want / DISC_SECTOR_SIZE;
+        err = raw_read10(&raw, (uint32_t)(done / DISC_SECTOR_SIZE),
+                         sectors, buf, want);
+        if (err) {
+            stop_reason = "error";
+            break;
+        }
+        done += want;
+        elapsed = ticks_to_us(&ctx->timer, timer_now(&ctx->timer) - start);
+        if (ctx->cfg.seconds &&
+            elapsed >= (uint64_t)ctx->cfg.seconds * 1000000ULL) {
+            stop_reason = "seconds";
+            break;
+        }
+    }
+    if (!err && maxbytes_limited && strcmp(stop_reason, "seconds") != 0)
+        stop_reason = "maxbytes";
+    elapsed = ticks_to_us(&ctx->timer, timer_now(&ctx->timer) - start);
+    FreeVec(buf);
+    raw_method = raw.method ? raw.method : "SCSI_DIRECT";
+    raw_close(&raw);
+
+    r.status = (err && done == 0) ? "error" : stop_reason;
+    r.error = err ? "READ(10) failed" : "";
+    r.path = ctx->ident.exec_device;
+    r.selector = "LBA0";
+    r.access_shape = raw_method;
+    r.file_size = capacity_bytes;
+    r.bytes = done;
+    r.ops = done / DISC_SECTOR_SIZE;
+    r.read_size = DISC_SECTOR_SIZE;
+    r.buffer_size = chunk;
+    r.working_set_bytes = target_bytes;
+    r.elapsed_us = elapsed;
+    r.rate_kib_s = rate_kib_s(done, elapsed);
+    r.raw_rate_kib_s = r.rate_kib_s;
+    r.x_speed_milli = x_speed_milli(r.rate_kib_s, 150);
     emit_result(ctx, &r);
-    memset(&r, 0, sizeof(r));
-    r.test = "seq_data_efficiency";
-    r.status = "skipped";
-    r.error = "raw denominator unavailable";
-    emit_result(ctx, &r);
+    emit_efficiency_skip(ctx, r.raw_rate_kib_s,
+                         "raw range is not known file extent");
 }
 
 enum {
@@ -2647,7 +2956,7 @@ int main(void)
         run_small_open(&ctx);
         run_mixed_switch(&ctx);
         run_cache_probe(&ctx);
-        run_raw_stub(&ctx);
+        run_raw_tests(&ctx);
     }
 
     emit_summary(&ctx);
