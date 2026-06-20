@@ -3,10 +3,10 @@ set -eu
 
 outdir=${1:-build/fixtures}
 root="$outdir/root"
-iso="$outdir/cdbench-plain.iso"
 volid=CDBENCH_FIXTURE
 
 rm -rf "$root"
+rm -f "$outdir"/cdbench-*.iso
 mkdir -p "$root/bench/tree/deep/a/b/c" "$root/bench/tree/wide"
 
 dd if=/dev/zero of="$root/bench/seq.bin" bs=1024 count=32768 2>/dev/null
@@ -35,14 +35,43 @@ EOF
 
 mkdir -p "$outdir"
 if command -v xorriso >/dev/null 2>&1; then
-    xorriso -as mkisofs -quiet -R -J -V "$volid" -o "$iso" "$root"
+    xorriso -as mkisofs -quiet -R -J -V "$volid" \
+        -o "$outdir/cdbench-plain.iso" "$root"
+    xorriso -as mkisofs -quiet -V "$volid" \
+        -o "$outdir/cdbench-iso9660.iso" "$root"
+    xorriso -as mkisofs -quiet -udf -V "$volid" \
+        -o "$outdir/cdbench-udf.iso" "$root"
+    xorriso -as mkisofs -quiet -R -J -udf -V "$volid" \
+        -o "$outdir/cdbench-bridge.iso" "$root"
 elif command -v mkisofs >/dev/null 2>&1; then
-    mkisofs -quiet -R -J -V "$volid" -o "$iso" "$root"
+    mkisofs -quiet -R -J -V "$volid" \
+        -o "$outdir/cdbench-plain.iso" "$root"
+    mkisofs -quiet -V "$volid" -o "$outdir/cdbench-iso9660.iso" \
+        "$root"
+    if mkisofs -quiet -udf -V "$volid" \
+        -o "$outdir/cdbench-udf.iso" "$root" 2>/dev/null; then
+        mkisofs -quiet -R -J -udf -V "$volid" \
+            -o "$outdir/cdbench-bridge.iso" "$root"
+    else
+        echo "mkisofs does not support -udf; skipped UDF fixtures" >&2
+    fi
 elif command -v genisoimage >/dev/null 2>&1; then
-    genisoimage -quiet -R -J -V "$volid" -o "$iso" "$root"
+    genisoimage -quiet -R -J -V "$volid" \
+        -o "$outdir/cdbench-plain.iso" "$root"
+    genisoimage -quiet -V "$volid" -o "$outdir/cdbench-iso9660.iso" \
+        "$root"
+    if genisoimage -quiet -udf -V "$volid" \
+        -o "$outdir/cdbench-udf.iso" "$root" 2>/dev/null; then
+        genisoimage -quiet -R -J -udf -V "$volid" \
+            -o "$outdir/cdbench-bridge.iso" "$root"
+    else
+        echo "genisoimage does not support -udf; skipped UDF fixtures" >&2
+    fi
 else
     echo "No ISO generator found (xorriso, mkisofs, or genisoimage)" >&2
     exit 1
 fi
 
-echo "$iso"
+for iso in "$outdir"/cdbench-*.iso; do
+    [ -e "$iso" ] && echo "$iso"
+done

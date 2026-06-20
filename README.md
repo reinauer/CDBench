@@ -36,6 +36,9 @@ or `NSCMD_TD_SCSI`, and only reads 2048-byte sectors. The raw row is a device
 baseline from LBA 0; `seq_data_efficiency` remains skipped until the tool can
 prove that the raw range matches the filesystem file being read.
 
-`make fixture-iso` creates `build/fixtures/cdbench-plain.iso` with volume
-label `CDBENCH_FIXTURE`, a 32 MiB sequential target, an 8 MiB random target,
-cache-size probe files, a wide small-file directory, and a deep path.
+`make fixture-iso` creates fixture images with volume label
+`CDBENCH_FIXTURE`, a 32 MiB sequential target, an 8 MiB random target,
+cache-size probe files, a wide small-file directory, and a deep path. The
+existing `build/fixtures/cdbench-plain.iso` name is kept for compatibility;
+when the local ISO tool supports it, ISO9660-only, UDF, and bridge variants
+are emitted next to it.
