@@ -25,6 +25,11 @@ The default human-readable output prints a compact summary. `VERBOSE` prints
 all per-test rows with the full selected paths. `CSV` always emits the full
 machine-readable result set.
 
+Mount identity includes best-effort version metadata. CDBench records the
+handler `$VER:` string by scanning the live loaded filesystem seglist, records
+the matching `FileSystem.resource` version when available, and records the
+backing Exec device library version/id after opening the device.
+
 The raw SCSI baseline is opt-in. It opens the backing Exec device identified
 from the mount, issues SCSI READ CAPACITY and READ(10) through `HD_SCSICMD`
 or `NSCMD_TD_SCSI`, and only reads 2048-byte sectors. The raw row is a device

@@ -8,11 +8,13 @@
 #include <exec/memory.h>
 #include <exec/io.h>
 #include <exec/errors.h>
+#include <exec/devices.h>
 #include <dos/dos.h>
 #include <dos/dosasl.h>
 #include <dos/dosextens.h>
 #include <dos/exall.h>
 #include <dos/filehandler.h>
+#include <resources/filesysres.h>
 #include <devices/timer.h>
 #include <devices/scsidisk.h>
 #include <devices/newstyle.h>
@@ -26,6 +28,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 
 #ifndef NSCMD_TD_SCSI
@@ -40,6 +43,8 @@
 #define EXALL_BUFSIZE 32768UL
 #define MAX_CACHE_PROBE (4UL * 1024UL * 1024UL)
 #define CACHE_HOT_SET (32UL * 1024UL)
+#define MAX_VERSION_SCAN (256UL * 1024UL)
+#define MAX_VERSION_SEGMENTS 48
 
 struct Device *TimerBase;
 
@@ -74,10 +79,15 @@ typedef struct Catalog {
 typedef struct Identity {
     char dos_device[64];
     char handler[128];
+    char handler_version[192];
+    char handler_version_source[32];
     char exec_device[128];
+    char exec_device_version[192];
+    char exec_device_id[192];
     uint32_t exec_unit;
     uint32_t open_flags;
     uint32_t dostype;
+    uint32_t filesystem_version;
     uint32_t sector_size;
     uint32_t buffers;
     uint32_t bufmemtype;
@@ -86,6 +96,8 @@ typedef struct Identity {
     char control[192];
     char source[64];
     int have_exec;
+    int have_exec_device_version;
+    int have_filesystem_version;
 } Identity;
 
 typedef struct Config {
@@ -559,6 +571,184 @@ static int bstr_to_c(BSTR bstr, char *out, size_t outsz)
     return 1;
 }
 
+static int is_version_char(unsigned char c)
+{
+    return c >= 32 && c < 127;
+}
+
+static void copy_version_text(char *dst, size_t dstsz, const UBYTE *src,
+                              size_t max_len)
+{
+    size_t i = 0;
+
+    if (!dst || dstsz == 0)
+        return;
+    dst[0] = '\0';
+    while (i + 1 < dstsz && i < max_len && src[i] &&
+           src[i] != '\n' && src[i] != '\r' &&
+           is_version_char(src[i])) {
+        dst[i] = (char)src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static int scan_bytes_for_version(const UBYTE *mem, size_t len,
+                                  char *out, size_t outsz)
+{
+    size_t i;
+
+    if (!mem || !out || outsz == 0 || len < 6)
+        return 0;
+    for (i = 0; i + 5 < len; i++) {
+        if (mem[i] == '$' && mem[i + 1] == 'V' &&
+            mem[i + 2] == 'E' && mem[i + 3] == 'R' &&
+            mem[i + 4] == ':') {
+            copy_version_text(out, outsz, mem + i, len - i);
+            return out[0] != '\0';
+        }
+    }
+    return 0;
+}
+
+static size_t segment_scan_len(const UBYTE *seg)
+{
+    ULONG raw_size;
+    size_t len = 0;
+
+    if (!seg)
+        return 0;
+    raw_size = ((const ULONG *)seg)[-1];
+    if (raw_size >= 8 && raw_size <= MAX_VERSION_SCAN)
+        len = (size_t)raw_size;
+    if (raw_size > 0 && raw_size <= MAX_VERSION_SCAN / 4) {
+        size_t long_len = (size_t)raw_size * 4;
+
+        if (long_len > len)
+            len = long_len;
+    } else if (raw_size > MAX_VERSION_SCAN &&
+               raw_size <= MAX_VERSION_SCAN * 4) {
+        len = MAX_VERSION_SCAN;
+    }
+    if (len > MAX_VERSION_SCAN)
+        len = MAX_VERSION_SCAN;
+    return len;
+}
+
+static int scan_seglist_for_version(BPTR seglist, char *out, size_t outsz)
+{
+    BPTR seg = seglist;
+    unsigned count = 0;
+
+    if (out && outsz)
+        out[0] = '\0';
+    while (seg && count < MAX_VERSION_SEGMENTS) {
+        UBYTE *base = (UBYTE *)BADDR(seg);
+        size_t len;
+        BPTR next;
+
+        if (!base || (ULONG)base < 4096UL)
+            return 0;
+        len = segment_scan_len(base);
+        if (len > 4 && scan_bytes_for_version(base + 4, len - 4,
+                                              out, outsz))
+            return 1;
+        next = *(BPTR *)base;
+        if (next == seg)
+            break;
+        seg = next;
+        count++;
+    }
+    return 0;
+}
+
+static struct Process *process_from_port(struct MsgPort *port)
+{
+    if (!port)
+        return NULL;
+    return (struct Process *)((UBYTE *)port -
+        offsetof(struct Process, pr_MsgPort));
+}
+
+static void format_dotted_version(char *dst, size_t dstsz, uint32_t v)
+{
+    uint32_t major = v >> 16;
+    uint32_t minor = v & 0xffffUL;
+
+    if (!dst || dstsz == 0)
+        return;
+    if (major)
+        snprintf(dst, dstsz, "%lu.%lu",
+                 (unsigned long)major, (unsigned long)minor);
+    else
+        snprintf(dst, dstsz, "%lu", (unsigned long)v);
+}
+
+static void identify_exec_device_version(Identity *ident)
+{
+    struct MsgPort *port;
+    struct IOStdReq *io;
+    BYTE err;
+
+    if (!ident->have_exec)
+        return;
+    port = CreateMsgPort();
+    if (!port)
+        return;
+    io = (struct IOStdReq *)CreateIORequest(port, sizeof(struct IOStdReq));
+    if (!io) {
+        DeleteMsgPort(port);
+        return;
+    }
+    err = OpenDevice((CONST_STRPTR)ident->exec_device, ident->exec_unit,
+                     (struct IORequest *)io, ident->open_flags);
+    if (err == 0 && io->io_Device) {
+        struct Device *dev = io->io_Device;
+        struct Library *lib = &dev->dd_Library;
+
+        snprintf(ident->exec_device_version,
+                 sizeof(ident->exec_device_version), "%lu.%lu",
+                 (unsigned long)lib->lib_Version,
+                 (unsigned long)lib->lib_Revision);
+        ident->have_exec_device_version = 1;
+        if (lib->lib_IdString)
+            copy_version_text(ident->exec_device_id,
+                              sizeof(ident->exec_device_id),
+                              (const UBYTE *)lib->lib_IdString,
+                              sizeof(ident->exec_device_id) - 1);
+        CloseDevice((struct IORequest *)io);
+    }
+    DeleteIORequest((struct IORequest *)io);
+    DeleteMsgPort(port);
+}
+
+static BPTR identify_filesys_resource_version(Identity *ident)
+{
+    struct FileSysResource *fsr;
+    struct Node *node;
+    BPTR seglist = 0;
+
+    if (!ident->dostype)
+        return 0;
+    fsr = (struct FileSysResource *)OpenResource((CONST_STRPTR)FSRNAME);
+    if (!fsr)
+        return 0;
+    Forbid();
+    for (node = fsr->fsr_FileSysEntries.lh_Head;
+         node && node->ln_Succ; node = node->ln_Succ) {
+        struct FileSysEntry *fse = (struct FileSysEntry *)node;
+
+        if (fse->fse_DosType != ident->dostype)
+            continue;
+        ident->filesystem_version = fse->fse_Version;
+        ident->have_filesystem_version = fse->fse_Version != 0;
+        seglist = fse->fse_SegList;
+        break;
+    }
+    Permit();
+    return seglist;
+}
+
 static void strip_device_colon(const char *device, char *out, size_t outsz)
 {
     size_t i = 0;
@@ -578,6 +768,8 @@ static void identify_device(RunContext *ctx)
     struct DosList *list;
     struct DosList *node;
     char name[64];
+    BPTR device_seglist = 0;
+    struct MsgPort *handler_port = NULL;
 
     memset(&ctx->ident, 0, sizeof(ctx->ident));
     strip_device_colon(ctx->cfg.device, name, sizeof(name));
@@ -595,6 +787,8 @@ static void identify_device(RunContext *ctx)
 
         bstr_to_c(node->dol_misc.dol_handler.dol_Handler,
                   ctx->ident.handler, sizeof(ctx->ident.handler));
+        device_seglist = node->dol_misc.dol_handler.dol_SegList;
+        handler_port = node->dol_Task;
         if (node->dol_misc.dol_handler.dol_Startup)
             fssm = (struct FileSysStartupMsg *)
                 BADDR(node->dol_misc.dol_handler.dol_Startup);
@@ -621,6 +815,31 @@ static void identify_device(RunContext *ctx)
                  "doslist");
     }
     UnLockDosList(LDF_DEVICES | LDF_READ);
+    if (ctx->ident.dostype) {
+        BPTR resource_seglist = identify_filesys_resource_version(&ctx->ident);
+
+        if (!device_seglist)
+            device_seglist = resource_seglist;
+    }
+    if (device_seglist &&
+        scan_seglist_for_version(device_seglist,
+                                 ctx->ident.handler_version,
+                                 sizeof(ctx->ident.handler_version))) {
+        snprintf(ctx->ident.handler_version_source,
+                 sizeof(ctx->ident.handler_version_source), "seglist");
+    } else if (handler_port) {
+        struct Process *proc = process_from_port(handler_port);
+
+        if (proc && proc->pr_SegList &&
+            scan_seglist_for_version(proc->pr_SegList,
+                                     ctx->ident.handler_version,
+                                     sizeof(ctx->ident.handler_version))) {
+            snprintf(ctx->ident.handler_version_source,
+                     sizeof(ctx->ident.handler_version_source),
+                     "process");
+        }
+    }
+    identify_exec_device_version(&ctx->ident);
 }
 
 static void resolve_title(RunContext *ctx)
@@ -1112,6 +1331,19 @@ static void emit_summary(const RunContext *ctx)
                (unsigned long)ctx->ident.buffers);
         if (ctx->ident.handler[0])
             printf(", handler=%s", ctx->ident.handler);
+        if (ctx->ident.handler_version[0])
+            printf(", handler_version=\"%s\"",
+                   ctx->ident.handler_version);
+        if (ctx->ident.have_filesystem_version) {
+            char ver[32];
+
+            format_dotted_version(ver, sizeof(ver),
+                                  ctx->ident.filesystem_version);
+            printf(", fs_version=%s", ver);
+        }
+        if (ctx->ident.have_exec_device_version)
+            printf(", device_version=%s",
+                   ctx->ident.exec_device_version);
         if (ctx->ident.control[0])
             printf(", control=%s", ctx->ident.control);
         printf("\n");
@@ -1257,7 +1489,12 @@ static void emit_result(RunContext *ctx, const Result *r)
         csv_field(ctx->cfg.device); putchar(',');
         csv_field(ctx->ident.dos_device); putchar(',');
         csv_field(ctx->ident.handler); putchar(',');
+        csv_field(ctx->ident.handler_version); putchar(',');
+        csv_field(ctx->ident.handler_version_source); putchar(',');
+        csv_u64(ctx->ident.filesystem_version);
         csv_field(ctx->ident.exec_device); putchar(',');
+        csv_field(ctx->ident.exec_device_version); putchar(',');
+        csv_field(ctx->ident.exec_device_id); putchar(',');
         printf("%lu,", (unsigned long)ctx->ident.exec_unit);
         printf("%08lx,", (unsigned long)ctx->ident.dostype);
         printf("%lu,", (unsigned long)ctx->ident.sector_size);
@@ -2875,12 +3112,15 @@ static void config_cleanup(Config *cfg)
 
 static void print_csv_header(void)
 {
-    puts("title,device,dos_device,handler,exec_device,exec_unit,dostype,sector_size,"
+    puts("title,device,dos_device,handler,handler_version,"
+         "handler_version_source,filesystem_version,exec_device,"
+         "exec_device_version,exec_device_id,exec_unit,dostype,sector_size,"
          "buffers,control,disc_type,disc_fingerprint,test,status,error,path,"
-         "selector,pass,seed,access_shape,file_size,bytes,ops,ops_s,read_size,"
-         "buffer_size,working_set_bytes,hot_set_bytes,eviction_bytes,"
-         "elapsed_us,rate_kib_s,x_speed,raw_rate_kib_s,efficiency_pct,"
-         "warm_cold_ratio,avg_us,median_us,p95_us,min_us,max_us");
+         "selector,pass,seed,access_shape,file_size,bytes,ops,ops_s,"
+         "read_size,buffer_size,working_set_bytes,hot_set_bytes,"
+         "eviction_bytes,elapsed_us,rate_kib_s,x_speed,raw_rate_kib_s,"
+         "efficiency_pct,warm_cold_ratio,avg_us,median_us,p95_us,min_us,"
+         "max_us");
 }
 
 int main(void)
@@ -2913,16 +3153,25 @@ int main(void)
     else {
         printf("CDBench device=%s title=\"%s\" timer_freq=%lu\n",
                ctx.cfg.device, ctx.title, (unsigned long)ctx.timer.freq);
-        if (ctx.ident.have_exec)
+        if (ctx.ident.have_exec) {
             printf("Backing device: %s unit %lu dos=%s buffers=%lu "
-                   "sector=%lu handler=%s control=%s\n",
+                   "sector=%lu handler=%s",
                    ctx.ident.exec_device,
                    (unsigned long)ctx.ident.exec_unit,
                    ctx.ident.dos_device,
                    (unsigned long)ctx.ident.buffers,
                    (unsigned long)ctx.ident.sector_size,
-                   ctx.ident.handler,
-                   ctx.ident.control);
+                   ctx.ident.handler);
+            if (ctx.ident.handler_version[0])
+                printf(" handler_version=\"%s\"",
+                       ctx.ident.handler_version);
+            if (ctx.ident.have_exec_device_version)
+                printf(" device_version=%s",
+                       ctx.ident.exec_device_version);
+            if (ctx.ident.control[0])
+                printf(" control=%s", ctx.ident.control);
+            printf("\n");
+        }
         if (!ctx.cfg.verbose)
             printf("Running benchmarks...\n");
     }
