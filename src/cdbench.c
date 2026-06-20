@@ -1362,6 +1362,104 @@ static const CatalogEntry *find_largest(const Catalog *cat, EntryKind kind)
     return best;
 }
 
+static const CatalogEntry *find_by_path(const Catalog *cat, const char *path,
+                                        EntryKind kind)
+{
+    size_t i;
+
+    if (!path)
+        return NULL;
+    for (i = 0; i < cat->count; i++) {
+        const CatalogEntry *e = &cat->items[i];
+
+        if (e->kind != kind)
+            continue;
+        if (str_casecmp(e->path, path) == 0)
+            return e;
+    }
+    return NULL;
+}
+
+static const CatalogEntry *find_by_suffix(const Catalog *cat,
+                                          EntryKind kind,
+                                          const char *suffix)
+{
+    size_t i;
+
+    for (i = 0; i < cat->count; i++) {
+        const CatalogEntry *e = &cat->items[i];
+
+        if (e->kind == kind && ends_with_ci(e->path, suffix))
+            return e;
+    }
+    return NULL;
+}
+
+static uint64_t examine_file_size(const char *path)
+{
+    BPTR lock;
+    struct FileInfoBlock *fib;
+    uint64_t size = 0;
+
+    if (!path)
+        return 0;
+    lock = Lock((CONST_STRPTR)path, SHARED_LOCK);
+    if (!lock)
+        return 0;
+    fib = (struct FileInfoBlock *)AllocDosObject(DOS_FIB, NULL);
+    if (fib) {
+        if (Examine(lock, fib) && fib->fib_DirEntryType <= 0)
+            size = (uint64_t)(uint32_t)fib->fib_Size;
+        FreeDosObject(DOS_FIB, fib);
+    }
+    UnLock(lock);
+    return size;
+}
+
+static uint64_t selected_file_size(const Catalog *cat, const char *override,
+                                   const CatalogEntry *entry,
+                                   EntryKind kind)
+{
+    const CatalogEntry *explicit_entry;
+
+    if (!override || !override[0])
+        return entry ? entry->size : 0;
+    explicit_entry = find_by_path(cat, override, kind);
+    if (explicit_entry)
+        return explicit_entry->size;
+    return examine_file_size(override);
+}
+
+static const CatalogEntry *select_seq_data_entry(const Catalog *cat,
+                                                 const char **selector)
+{
+    const CatalogEntry *entry;
+
+    entry = find_by_suffix(cat, ENTRY_DATA, "bench/seq.bin");
+    if (entry) {
+        if (selector)
+            *selector = "fixture";
+        return entry;
+    }
+    if (selector)
+        *selector = "largest";
+    return find_largest(cat, ENTRY_DATA);
+}
+
+static const CatalogEntry *select_rand_data_entry(const Catalog *cat,
+                                                  const char **selector)
+{
+    const CatalogEntry *entry;
+
+    entry = find_by_suffix(cat, ENTRY_DATA, "bench/rand.bin");
+    if (entry) {
+        if (selector)
+            *selector = "fixture";
+        return entry;
+    }
+    return select_seq_data_entry(cat, selector);
+}
+
 static const CatalogEntry *find_deepest_dir(const Catalog *cat)
 {
     const CatalogEntry *best = NULL;
@@ -1483,8 +1581,11 @@ static uint64_t seq_read_file(const RunContext *ctx, const char *path,
 
 static void run_seq_data(RunContext *ctx)
 {
-    const CatalogEntry *entry = find_largest(&ctx->catalog, ENTRY_DATA);
+    const char *selector = NULL;
+    const CatalogEntry *entry = select_seq_data_entry(&ctx->catalog,
+                                                      &selector);
     const char *path = selected_path(ctx->cfg.seq_path, entry);
+    uint64_t file_size;
     Result r;
 
     if (!path) {
@@ -1495,11 +1596,13 @@ static void run_seq_data(RunContext *ctx)
         emit_result(ctx, &r);
         return;
     }
+    file_size = selected_file_size(&ctx->catalog, ctx->cfg.seq_path, entry,
+                                   ENTRY_DATA);
     seq_read_file(ctx, path, ctx->cfg.bufsize, ctx->cfg.maxbytes,
                   ctx->cfg.seconds, &r);
     r.test = "seq_data";
-    r.selector = ctx->cfg.seq_path ? "override" : "largest";
-    r.file_size = entry ? entry->size : 0;
+    r.selector = ctx->cfg.seq_path ? "override" : selector;
+    r.file_size = file_size;
     r.x_speed_milli = x_speed_milli(r.rate_kib_s, 150);
     emit_result(ctx, &r);
 }
@@ -1538,7 +1641,8 @@ static void run_seq_audio(RunContext *ctx)
                   ctx->cfg.seconds, &r);
     r.test = "seq_audio";
     r.selector = ctx->cfg.audio_path ? "override" : "largest";
-    r.file_size = entry ? entry->size : 0;
+    r.file_size = selected_file_size(&ctx->catalog, ctx->cfg.audio_path,
+                                     entry, ENTRY_AUDIO);
     r.x_speed_milli = x_speed_milli(r.rate_kib_s, 176);
     emit_result(ctx, &r);
 }
@@ -1551,7 +1655,7 @@ static uint32_t lcg_next(uint32_t *state)
 
 static void run_random_pattern(RunContext *ctx, const char *test,
                                const char *path, uint64_t file_size,
-                               int pattern)
+                               int pattern, const char *selector)
 {
     BPTR fh;
     void *buf;
@@ -1564,6 +1668,7 @@ static void run_random_pattern(RunContext *ctx, const char *test,
     memset(&r, 0, sizeof(r));
     r.test = test;
     r.path = path;
+    r.selector = selector;
     r.read_size = ctx->cfg.readsize;
     r.seed = seed;
     r.file_size = file_size;
@@ -1637,9 +1742,12 @@ static void run_random_pattern(RunContext *ctx, const char *test,
 
 static void run_random_tests(RunContext *ctx)
 {
-    const CatalogEntry *entry = find_largest(&ctx->catalog, ENTRY_DATA);
+    const char *selector = NULL;
+    const CatalogEntry *entry = select_rand_data_entry(&ctx->catalog,
+                                                       &selector);
     const char *path = selected_path(ctx->cfg.rand_path, entry);
-    uint64_t size = entry ? entry->size : 0;
+    uint64_t size = selected_file_size(&ctx->catalog, ctx->cfg.rand_path,
+                                       entry, ENTRY_DATA);
 
     if (!path) {
         Result r;
@@ -1651,11 +1759,13 @@ static void run_random_tests(RunContext *ctx)
         emit_result(ctx, &r);
         return;
     }
-    run_random_pattern(ctx, "rand_same", path, size, 0);
-    run_random_pattern(ctx, "rand_adjacent", path, size, 1);
-    run_random_pattern(ctx, "rand_edges", path, size, 2);
-    run_random_pattern(ctx, "rand_stride", path, size, 3);
-    run_random_pattern(ctx, "rand_seeded", path, size, 4);
+    if (ctx->cfg.rand_path)
+        selector = "override";
+    run_random_pattern(ctx, "rand_same", path, size, 0, selector);
+    run_random_pattern(ctx, "rand_adjacent", path, size, 1, selector);
+    run_random_pattern(ctx, "rand_edges", path, size, 2, selector);
+    run_random_pattern(ctx, "rand_stride", path, size, 3, selector);
+    run_random_pattern(ctx, "rand_seeded", path, size, 4, selector);
 }
 
 static void timed_discovery_result(RunContext *ctx, uint64_t elapsed_us,
