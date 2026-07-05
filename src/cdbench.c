@@ -48,6 +48,9 @@
 
 struct Device *TimerBase;
 
+/* request a larger stack than the 4 KiB CLI default */
+unsigned long __stack = 16384;
+
 typedef enum EntryKind {
     ENTRY_DATA,
     ENTRY_AUDIO,
