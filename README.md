@@ -8,17 +8,18 @@ files.
 Build:
 
 ```sh
-make
-make fixture-iso
+$ make
+$ make fixture-iso
 ```
 
 Typical use on AmigaOS:
 
 ```text
-CDBench DEVICE CD0:
-CDBench DEVICE CD0: VERBOSE
-CDBench DEVICE CD0: CSV
-CDBench DEVICE CD0: RAW CACHE
+1> stack 16384
+1> CDBench DEVICE CD0:
+1> CDBench DEVICE CD0: VERBOSE
+1> CDBench DEVICE CD0: CSV
+1> CDBench DEVICE CD0: RAW CACHE
 ```
 
 The default human-readable output prints a compact summary. `VERBOSE` prints
