@@ -14,7 +14,7 @@ Sorted by sequential read throughput;
 | Filesystem | Version | Seq read KiB/s (×speed) | Discovery ent/s | ExAll traversal ent/s |
 |---|---|--:|--:|--:|
 | CDFileSystem | 47.26 | 155 559 (1037×) | 7 070 | 7 479 |
-| AllegroCDFS | 3.4* | **217 287** (1449×) | 6 785 | 6 913 |
+| AllegroCDFS | 3.9 | **216 923** (1446×) | 7 087 | 7 281 |
 | BabelCDFS | 1.2 (1993) | 196 319 (1309×) | **9 139** | 9 241 |
 | CacheCDFS43 | 43.4 (1995) | 179 327 (1196×) | 5 829 | 5 171 |
 | CacheCDFS | 106.1 (1995) | 178 927 (1193×) | 5 885 | 5 299 |
@@ -27,7 +27,7 @@ Sorted by sequential read throughput;
 | Filesystem | Rand same-off | Rand stride | Rand seeded | Deep lock | Open-from-lock | Small open+read |
 |---|--:|--:|--:|--:|--:|--:|
 | CDFileSystem | 59 | 471 | 341 | **226** | **241** | 1 090 |
-| AllegroCDFS | 148 | 272 | **148** | 617 | 383 | 1 897 |
+| AllegroCDFS | 148 | 270 | **148** | 482 | 316 | 1 802 |
 | BabelCDFS | 160 | 301 | 163 | 608 | 415 | 2 813 |
 | CacheCDFS43 | **58** | 364 | 255 | 949 | 1 098 | 3 260 |
 | CacheCDFS | **58** | 365 | 256 | 930 | 1 080 | 3 283 |
@@ -42,10 +42,11 @@ Sorted by sequential read throughput;
   rate (11 657 ent/s, ~1.26× the next-best BabelCDFS) and by far the fastest
   small-file open+read (655 µs — next best is CDFileSystem at 1 090). Its
   sequential throughput (1318×) is second only to AllegroCDFS, 27% ahead of the
-  shipping CDFileSystem 47.26. BabelCDFS now pips it on raw directory Discovery
+  shipping CDFileSystem 47.26. BabelCDFS pips it on raw directory Discovery
   (9 139 vs 7 520 ent/s).
-- **AllegroCDFS's** chart-topping 1449× sequential number is worth a caveat:
-  Great streaming, but the worst small-open latency after the CacheCDFS pair.
+- **AllegroCDFS 3.9** tops sequential throughput (1 446×), but its metadata is
+  middling — small-file open+read 1 802 µs, behind ODFileSystem and
+  CDFileSystem.
 - **CacheCDFS 106.1 vs 43.4** are effectively identical twins on every metric
   — the newer build brought no measurable change on this workload.
 - **AsimCDFS is an outlier** at 54× sequential. Note it mounted with
@@ -57,10 +58,7 @@ Sorted by sequential read throughput;
   (AmiCDFS via its `LC` control), not reading a different disc.
 - **BabelCDFS** — once mounted the right way (it is a DOS *handler*, mounted via
   `Handler`/`Startup=<device>/<unit>`, not a block-device filesystem), the 1993
-  vintage is startlingly competitive: 3rd-fastest sequential (1309×), the
-  fastest directory Discovery of the field (9 139 ent/s), and 2nd-best ExAll
-  traversal (9 241) behind only ODFileSystem — though its small-file open+read
-  (2 813 µs) is among the slowest.
-
-\* AllegroCDFS reports `$VER: AllegroCDFS V3.4` (fs_version 3.3).
-
+  vintage is startlingly competitive: 3rd-fastest sequential (1 309×, all but
+  tied with ODFileSystem), the fastest directory Discovery of the field
+  (9 139 ent/s), and 2nd-best ExAll traversal (9 241) behind only ODFileSystem —
+  though its small-file open+read (2 813 µs) is among the slowest.
