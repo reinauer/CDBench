@@ -8,8 +8,10 @@ as opposed to measuring CD/DVD drive latencies.
 
 Each result is the median of three runs, each after a fresh boot, with the
 handler active before CDBench starts. Repeat runs differed by at most 0.1% in
-throughput and 2 µs in latency. ODFileSystem 1.0 beta1 is the 68020 build of
-v0.9.0-2 with HFS and HFS+ directory fixes.
+throughput and 2 µs in latency. ODFileSystem 1.0 beta2 is the 68020 build of
+v0.9.0-8 with its own AmigaOS 3 memory and string functions, built with GCC
+16.2 and measured on 2026-11-02; the other filesystems were measured on
+2026-10-30.
 
 Sorted by sequential read throughput;
 **bold** = best in column.
@@ -19,7 +21,7 @@ Sorted by sequential read throughput;
 | Filesystem | Version | Seq read KiB/s (×speed) | Discovery ent/s | ExAll traversal ent/s |
 |---|---|--:|--:|--:|
 | AllegroCDFS | 3.9 | **203 539** (1357×) | 7 163 | 7 429 |
-| **ODFileSystem** | 1.0 beta1 | 188 232 (1255×) | 7 529 | **12 105** |
+| **ODFileSystem** | 1.0 beta2 | 188 260 (1255×) | 7 679 | **12 214** |
 | CDFileSystem | 47.26 | 186 612 (1244×) | 7 560 | 7 613 |
 | BabelCDFS | 1.2 (1993) | 186 525 (1244×) | **9 365** | 9 446 |
 | CacheCDFS43 | 43.4 (1995) | 171 111 (1141×) | 5 862 | 5 314 |
@@ -32,35 +34,40 @@ Sorted by sequential read throughput;
 | Filesystem | Rand same-off | Rand stride | Rand seeded | Deep lock | Open-from-lock | Small open+read |
 |---|--:|--:|--:|--:|--:|--:|
 | AllegroCDFS | 156 | 283 | **156** | 547 | 349 | 1 832 |
-| **ODFileSystem** | 68 | 274 | 214 | 225 | **211** | **416** |
+| **ODFileSystem** | 57 | **196** | 191 | 207 | **193** | **371** |
 | CDFileSystem | **56** | 683 | 605 | **146** | 213 | 1 103 |
 | BabelCDFS | 170 | 315 | 172 | 613 | 429 | 2 823 |
 | CacheCDFS43 | 59 | 373 | 265 | 993 | 1 076 | 3 274 |
 | CacheCDFS | 58 | 373 | 265 | 992 | 1 075 | 3 255 |
-| AmiCDFS | 69 | **256** | 185 | 681 | 439 | 2 733 |
+| AmiCDFS | 69 | 256 | 185 | 681 | 439 | 2 733 |
 | AsimCDFS | 273 | 419 | 410 | 288 | 529 | 1 731 |
 
-## ODFileSystem 0.6.0 to 1.0 beta1
+## ODFileSystem 0.6.0 to 1.0 beta2
 
-Both 68020 builds, measured the same way:
+All 68020 builds, measured the same way:
 
-| Test | 0.6.0 | 1.0 beta1 | Change |
-|---|--:|--:|--:|
-| Seq read KiB/s | 188 185 | 188 232 | 0.0% |
-| Discovery ent/s | 7 328 | 7 529 | +2.7% |
-| ExAll traversal ent/s | 11 600 | 12 105 | +4.4% |
-| Rand stride µs | 275 | 274 | −0.4% |
-| Deep lock µs | 319 | 225 | −29.5% |
-| Open-from-lock µs | 290 | 211 | −27.2% |
-| Small open+read µs | 644 | 416 | −35.4% |
+| Test | 0.6.0 | 1.0 beta1 | 1.0 beta2 | Change since 0.6.0 |
+|---|--:|--:|--:|--:|
+| Seq read KiB/s | 188 185 | 188 232 | 188 260 | 0.0% |
+| Discovery ent/s | 7 328 | 7 529 | 7 679 | +4.8% |
+| ExAll traversal ent/s | 11 600 | 12 105 | 12 214 | +5.3% |
+| Rand same-off µs | 68 | 68 | 57 | −16.2% |
+| Rand stride µs | 275 | 274 | 196 | −28.7% |
+| Rand seeded µs | 215 | 214 | 191 | −11.2% |
+| Deep lock µs | 319 | 225 | 207 | −35.1% |
+| Open-from-lock µs | 290 | 211 | 193 | −33.4% |
+| Small open+read µs | 644 | 416 | 371 | −42.4% |
 
 ## What stands out
 
 - **ODFileSystem** leads on metadata: the highest ExAll traversal rate
-  (12 105 ent/s, ~1.28× the next-best BabelCDFS) and by far the fastest
-  small-file open+read (416 µs, ~2.65× faster than CDFileSystem at 1 103). Its
-  sequential throughput is second to AllegroCDFS. Most of its gain since 0.6.0
-  comes from register-argument builds, added after the 0.9.0 release.
+  (12 214 ent/s, ~1.29× the next-best BabelCDFS) and by far the fastest
+  small-file open+read (371 µs, ~2.97× faster than CDFileSystem at 1 103). It
+  also has the fastest random stride reads. Its sequential throughput is second
+  to AllegroCDFS. Its lock and open gains since 0.6.0 come mostly from
+  register-argument builds, added after the 0.9.0 release, and its random-read
+  gains in 1.0 beta2 from its own memory functions, which copy sectors with
+  `CopyMem`.
 - **AllegroCDFS 3.9** tops sequential throughput, 8% ahead of ODFileSystem, but
   its metadata is middling: small-file open+read takes 1 832 µs.
 - **CDFileSystem 47.26** has the fastest deep lock (146 µs) and same-offset
