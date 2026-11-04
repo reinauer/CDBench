@@ -13,7 +13,7 @@ endif
 ifeq ($(TARGET_OS),aros)
 BUILD_DIR ?= build/aros
 AMIGA_CPUFLAGS ?= $(if $(findstring x86_64,$(CC_TARGET)),-mno-red-zone,)
-AMIGA_SYSFLAGS ?= -static
+AMIGA_SYSFLAGS ?=
 AMIGA_DEFS ?= -DAMIGA
 LIBS ?= -lamiga -larossupport -lgcc
 else ifeq ($(TARGET_OS),os4)

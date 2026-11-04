@@ -26,7 +26,7 @@ jobs:
           - platform: aros-x86_64
             image: amigadev/crosstools@sha256:9c4e978301da6b6584d68d4014caa1fa9e2689529e79e71f7190d40d1cb62e50
             compiler: x86_64-aros-gcc
-            sysflags: --sysroot=/opt/x86_64-aros -static
+            sysflags: --sysroot=/opt/x86_64-aros
             binary: build/aros/CDBench
     container: ${{ matrix.image }}
     steps:
