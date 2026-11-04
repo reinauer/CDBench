@@ -23,6 +23,20 @@
 #include <proto/exec.h>
 #include <proto/timer.h>
 
+#ifdef __AROS__
+#include <dos/bptr.h>
+#endif
+#ifdef __amigaos4__
+#include <dos/obsolete.h>
+#endif
+
+/* Only classic AmigaOS uses the Hunk layout scanned below. */
+#if !defined(__AROS__) && !defined(__amigaos4__)
+#define CDBENCH_HUNK_SEGLISTS 1
+#else
+#define CDBENCH_HUNK_SEGLISTS 0
+#endif
+
 #include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
@@ -47,6 +61,15 @@
 #define MAX_VERSION_SEGMENTS 48
 
 struct Device *TimerBase;
+#ifdef __amigaos4__
+struct TimerIFace *ITimer;
+#endif
+
+#ifdef __AROS__
+typedef struct timerequest BenchTimerRequest;
+#else
+typedef struct TimeRequest BenchTimerRequest;
+#endif
 
 /* request a larger stack than the 4 KiB CLI default */
 unsigned long __stack = 16384;
@@ -125,8 +148,9 @@ typedef struct Config {
 
 typedef struct TimerState {
     struct MsgPort *port;
-    struct TimeRequest *req;
+    BenchTimerRequest *req;
     uint32_t freq;
+    int device_open;
 } TimerState;
 
 typedef struct LatStats {
@@ -521,7 +545,7 @@ static int timer_init(TimerState *timer)
     timer->port = CreateMsgPort();
     if (!timer->port)
         return 0;
-    timer->req = (struct TimeRequest *)CreateIORequest(timer->port,
+    timer->req = (BenchTimerRequest *)CreateIORequest(timer->port,
                                                        sizeof(*timer->req));
     if (!timer->req) {
         timer_cleanup(timer);
@@ -532,18 +556,37 @@ static int timer_init(TimerState *timer)
         timer_cleanup(timer);
         return 0;
     }
-    TimerBase = timer->req->tr_node.io_Device;
+    timer->device_open = 1;
+    TimerBase = ((struct IORequest *)timer->req)->io_Device;
+#ifdef __amigaos4__
+    ITimer = (struct TimerIFace *)GetInterface((struct Library *)TimerBase,
+                                              "main", 1, NULL);
+    if (!ITimer) {
+        timer_cleanup(timer);
+        return 0;
+    }
+#endif
     {
         struct EClockVal v;
         timer->freq = ReadEClock(&v);
     }
-    return timer->freq != 0;
+    if (timer->freq == 0) {
+        timer_cleanup(timer);
+        return 0;
+    }
+    return 1;
 }
 
 static void timer_cleanup(TimerState *timer)
 {
+#ifdef __amigaos4__
+    if (ITimer) {
+        DropInterface((struct Interface *)ITimer);
+        ITimer = NULL;
+    }
+#endif
     if (timer->req) {
-        if (timer->req->tr_node.io_Device)
+        if (timer->device_open)
             CloseDevice((struct IORequest *)timer->req);
         DeleteIORequest((struct IORequest *)timer->req);
     }
@@ -563,13 +606,24 @@ static int bstr_to_c(BSTR bstr, char *out, size_t outsz)
     out[0] = '\0';
     if (!bstr)
         return 0;
+#ifdef __AROS__
+    b = (UBYTE *)AROS_BSTR_ADDR(bstr);
+    if (!b)
+        return 0;
+#ifdef AROS_FAST_BSTR
+    len = strlen((const char *)b);
+#else
+    len = b[-1];
+#endif
+#else
     b = (UBYTE *)BADDR(bstr);
     if (!b)
         return 0;
-    len = b[0];
+    len = *b++;
+#endif
     if (len >= outsz)
         len = outsz - 1;
-    memcpy(out, b + 1, len);
+    memcpy(out, b, len);
     out[len] = '\0';
     return 1;
 }
@@ -596,6 +650,7 @@ static void copy_version_text(char *dst, size_t dstsz, const UBYTE *src,
     dst[i] = '\0';
 }
 
+#if CDBENCH_HUNK_SEGLISTS
 static int scan_bytes_for_version(const UBYTE *mem, size_t len,
                                   char *out, size_t outsz)
 {
@@ -672,6 +727,8 @@ static struct Process *process_from_port(struct MsgPort *port)
     return (struct Process *)((UBYTE *)port -
         offsetof(struct Process, pr_MsgPort));
 }
+
+#endif /* CDBENCH_HUNK_SEGLISTS */
 
 static void format_dotted_version(char *dst, size_t dstsz, uint32_t v)
 {
@@ -771,8 +828,10 @@ static void identify_device(RunContext *ctx)
     struct DosList *list;
     struct DosList *node;
     char name[64];
+#if CDBENCH_HUNK_SEGLISTS
     BPTR device_seglist = 0;
     struct MsgPort *handler_port = NULL;
+#endif
 
     memset(&ctx->ident, 0, sizeof(ctx->ident));
     strip_device_colon(ctx->cfg.device, name, sizeof(name));
@@ -790,8 +849,10 @@ static void identify_device(RunContext *ctx)
 
         bstr_to_c(node->dol_misc.dol_handler.dol_Handler,
                   ctx->ident.handler, sizeof(ctx->ident.handler));
+#if CDBENCH_HUNK_SEGLISTS
         device_seglist = node->dol_misc.dol_handler.dol_SegList;
         handler_port = node->dol_Task;
+#endif
         if (node->dol_misc.dol_handler.dol_Startup)
             fssm = (struct FileSysStartupMsg *)
                 BADDR(node->dol_misc.dol_handler.dol_Startup);
@@ -821,9 +882,14 @@ static void identify_device(RunContext *ctx)
     if (ctx->ident.dostype) {
         BPTR resource_seglist = identify_filesys_resource_version(&ctx->ident);
 
+#if CDBENCH_HUNK_SEGLISTS
         if (!device_seglist)
             device_seglist = resource_seglist;
+#else
+        (void)resource_seglist;
+#endif
     }
+#if CDBENCH_HUNK_SEGLISTS
     if (device_seglist &&
         scan_seglist_for_version(device_seglist,
                                  ctx->ident.handler_version,
@@ -842,6 +908,7 @@ static void identify_device(RunContext *ctx)
                      "process");
         }
     }
+#endif /* CDBENCH_HUNK_SEGLISTS */
     identify_exec_device_version(&ctx->ident);
 }
 
@@ -3025,7 +3092,11 @@ enum {
 
 static int parse_args(Config *cfg)
 {
+#ifdef __AROS__
+    SIPTR args[ARG_COUNT];
+#else
     LONG args[ARG_COUNT];
+#endif
     struct RDArgs *rdargs;
     int ok = 1;
 
@@ -3095,6 +3166,8 @@ static int parse_args(Config *cfg)
     if (cfg->passes == 0)
         cfg->passes = DEFAULT_PASSES;
     FreeArgs(rdargs);
+    if (!cfg->device)
+        ok = 0;
     if (!ok) {
         config_cleanup(cfg);
         return 0;
