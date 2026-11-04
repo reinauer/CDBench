@@ -19,8 +19,11 @@ The compiler target selects the platform flags. `TARGET_OS=os3`, `os4`,
 or `aros` can override detection for compiler wrappers; `BUILD_DIR` selects
 an independent output directory. Use separate build directories when
 changing CPU/ABI flags, such as i386 versus x86-64 AROS. SDKs that require
-an explicit sysroot can pass it through `AMIGA_SYSFLAGS`, preserving the
-platform's other flags (for example, `--sysroot=/opt/x86_64-aros -static`).
+an explicit sysroot can pass it through `AMIGA_SYSFLAGS` (for example,
+`AMIGA_SYSFLAGS=--sysroot=/opt/x86_64-aros`).
+AROS uses the compiler's default C runtime libraries. Do not add `-static`:
+the SDK's `libstdc.static` omits the allocation and stdio functions CDBench
+needs.
 Use SDK headers and runtime libraries matching the guest OS.
 
 The workloads, ReadEClock timing, CSV columns, and summary selection are
