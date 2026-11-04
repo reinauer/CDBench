@@ -1,0 +1,40 @@
+name: Cross-platform builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: amigaos3
+            image: stefanreinauer/amiga-gcc:gcc-v16.2
+            compiler: m68k-amigaos-gcc
+            sysflags: -noixemul
+            binary: build/CDBench
+          - platform: amigaos4
+            image: stefanreinauer/amiga-gcc:gcc-v16.2-ppc
+            compiler: ppc-amigaos-gcc
+            sysflags: -mcrt=newlib
+            binary: build/os4/CDBench
+          - platform: aros-x86_64
+            image: amigadev/crosstools@sha256:9c4e978301da6b6584d68d4014caa1fa9e2689529e79e71f7190d40d1cb62e50
+            compiler: x86_64-aros-gcc
+            sysflags: --sysroot=/opt/x86_64-aros -static
+            binary: build/aros/CDBench
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CDBench
+        run: make CC=${{ matrix.compiler }} AMIGA_SYSFLAGS='${{ matrix.sysflags }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdbench-${{ matrix.platform }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
